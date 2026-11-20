@@ -1,0 +1,34 @@
+[project]
+name = "ai-agents-advanced"
+version = "0.1.0"
+description = "AI Agents: Advanced, a hands-on course by Dukers Ltd"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "openai>=3.0,<4",
+    "python-dotenv>=1.0",
+    "pydantic>=2.7",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "opentelemetry-sdk>=1.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.15"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Starter files keep half-finished variables and imports you will need on purpose.
+"modules/*/starter/*" = ["F841", "F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["modules"]
+pythonpath = ["."]
+addopts = "--import-mode=importlib -q"

@@ -1,0 +1,159 @@
+"""Module 08: tools that stay safe whatever arguments the model sends."""
+
+import ipaddress
+import json
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import time
+from collections.abc import Callable
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+class ToolSecurityError(Exception):
+    pass
+
+
+# ---------- files ----------
+
+
+class SandboxedFiles:
+    def __init__(self, root: str | Path, max_bytes: int = 100_000):
+        self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_bytes
+
+    def _resolve(self, rel_path: str) -> Path:
+        """Turn a model-supplied path into a real path inside the sandbox, or refuse."""
+        if not rel_path or Path(rel_path).is_absolute() or "\x00" in rel_path:
+            raise ToolSecurityError(f"refused path {rel_path!r}: must be relative")
+        real = (self.root / rel_path).resolve()  # follows symlinks and '..'
+        if not real.is_relative_to(self.root):
+            raise ToolSecurityError(f"refused path {rel_path!r}: outside the sandbox")
+        return real
+
+    def read(self, rel_path: str) -> str:
+        path = self._resolve(rel_path)
+        if path.stat().st_size > self.max_bytes:
+            raise ToolSecurityError("file too large")
+        return path.read_text(errors="replace")
+
+    def write(self, rel_path: str, text: str) -> str:
+        if len(text.encode()) > self.max_bytes:
+            raise ToolSecurityError("content too large")
+        path = self._resolve(rel_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return f"wrote {len(text)} characters to {path.relative_to(self.root)}"
+
+
+# ---------- commands ----------
+
+SAFE_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+
+
+def run_allowed_command(
+    command: str | list[str], allowlist: set[str], cwd: str | Path, timeout: float = 10, max_output: int = 4000
+) -> str:
+    """Run a program from the allowlist with no shell, a timeout and a minimal environment."""
+    argv = shlex.split(command) if isinstance(command, str) else list(command)
+    if not argv:
+        raise ToolSecurityError("empty command")
+    program = argv[0]
+    if "/" in program or "\\" in program or program not in allowlist:
+        raise ToolSecurityError(f"program {program!r} is not allowed")
+    resolved = shutil.which(program, path=SAFE_ENV["PATH"])
+    if resolved is None:
+        raise ToolSecurityError(f"program {program!r} not found")
+    try:
+        done = subprocess.run(
+            [resolved, *argv[1:]],
+            shell=False,
+            cwd=cwd,
+            env=SAFE_ENV,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ToolSecurityError(f"timed out after {timeout}s") from exc
+    return (done.stdout + done.stderr)[:max_output]
+
+
+# ---------- network ----------
+
+
+def check_url(url: str, allowed_hosts: set[str], resolver: Callable = socket.getaddrinfo) -> tuple[bool, str]:
+    """Allow only https URLs to approved hosts whose IP addresses are all public."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False, "only https is allowed"
+    host = (parsed.hostname or "").lower()
+    if host not in allowed_hosts:
+        return False, f"host {host!r} is not on the allowlist"
+    try:
+        infos = resolver(host, parsed.port or 443)
+    except OSError:
+        return False, "host did not resolve"
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            return False, f"{host} resolves to non-public address {ip}"
+    return True, "ok"
+
+
+# ---------- audit ----------
+
+REDACT = [(re.compile(r"(sk-|gsk_|ghp_)[A-Za-z0-9_-]{8,}"), r"\1[REDACTED]")]
+
+
+class AuditLog:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+
+    def record(self, tool: str, args: dict, decision: str, detail: str = "") -> None:
+        text = json.dumps(args, default=str)
+        for pattern, repl in REDACT:
+            text = pattern.sub(repl, text)
+        entry = {"ts": time.time(), "tool": tool, "args": text, "decision": decision, "detail": detail[:200]}
+        with self.path.open("a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+
+    def entries(self) -> list[dict]:
+        return [json.loads(line) for line in self.path.read_text().splitlines()] if self.path.exists() else []
+
+
+def guarded_call(audit: AuditLog, tool: str, func: Callable, **args) -> str:
+    """Run a tool, turning security errors into messages for the model and logging every decision."""
+    try:
+        result = str(func(**args))
+    except ToolSecurityError as exc:
+        audit.record(tool, args, "blocked", str(exc))
+        return f"error: blocked: {exc}"
+    except Exception as exc:
+        audit.record(tool, args, "error", type(exc).__name__)
+        return f"error: {type(exc).__name__}"
+    audit.record(tool, args, "allowed")
+    return result
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        box = SandboxedFiles(Path(tmp) / "sandbox")
+        audit = AuditLog(Path(tmp) / "audit.jsonl")
+        print(guarded_call(audit, "write", box.write, rel_path="notes/todo.txt", text="buy seeds"))
+        for attack in ["../../etc/passwd", "/etc/passwd", "notes/../../secret.txt"]:
+            print(attack, "->", guarded_call(audit, "read", box.read, rel_path=attack))
+        cmd = {"allowlist": {"echo", "ls"}, "cwd": tmp}
+        print(guarded_call(audit, "run", run_allowed_command, command="echo hello; rm -rf /", **cmd))
+        print(guarded_call(audit, "run", run_allowed_command, command="rm -rf /", **cmd))
+        hosts = {"docs.python.org"}
+        print(check_url("http://169.254.169.254/latest/meta-data/", hosts))
+        print(check_url("https://evil.example/", hosts))
+        print("audit entries:", len(audit.entries()))
